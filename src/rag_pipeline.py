@@ -23,6 +23,32 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 answer_cache = {}
 
+import io
+import os
+import re
+import boto3
+from PIL import Image, ImageOps
+from dotenv import load_dotenv
+from langchain.schema import Document
+from pdf2image import convert_from_path
+from typing import List
+from concurrent.futures import ThreadPoolExecutor
+
+from utils.logger_utils import logger
+from decorator.time_decorator import timeit
+from config.constants import AWS_CONFIG, MAX_THREADS
+
+# Load environment
+load_dotenv()
+
+# S3 client using config
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=AWS_CONFIG['access_key_id'],
+    aws_secret_access_key=AWS_CONFIG['secret_access_key'],
+    region_name=AWS_CONFIG['region']
+)
+
 @timeit
 def split_documents(bucket_name: str, folder_path: str):
     logger.info(f"Splitting documents in: {folder_path}")
@@ -30,17 +56,11 @@ def split_documents(bucket_name: str, folder_path: str):
     persist_dir = "./vector_store"
 
     chroma_client = chromadb.PersistentClient(path=persist_dir)
-    # existing_collections = [col.name for col in chroma_client.list_collections()]
-    existing_collections = chroma_client.list_collections()
-    
-    # if collection_name in existing_collections:
-    #     logger.info(f"Found existing collection: {collection_name}, deleting it...")
-    #     chroma_client.delete_collection(collection_name)
-    #     logger.info(f"Collection {collection_name} deleted.")
-    
-    # breakpoint()
+    collection_names = chroma_client.list_collections()
+    collection_names = [name if isinstance(name, str) else name.name for name in collection_names]  # backward safe
 
-    if collection_name in existing_collections:
+    # Case 1: Collection already exists
+    if collection_name in collection_names:
         logger.info(f"Found existing collection: {collection_name}")
         vectorstore = Chroma(
             collection_name=collection_name,
@@ -48,6 +68,77 @@ def split_documents(bucket_name: str, folder_path: str):
             embedding_function=OpenAIEmbeddings(model="text-embedding-3-small"),
             client=chroma_client
         )
+
+        logger.info(f"Checking for changes in S3 bucket: {bucket_name}/{folder_path}")
+
+        current_s3_files = set()
+        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=folder_path)
+        if "Contents" in response:
+            current_s3_files = {
+                obj["Key"] for obj in response["Contents"] if obj["Key"].endswith(".pdf")
+            }
+
+        collection_files = set()
+        results = vectorstore.get(include=["metadatas"])
+        if results.get("metadatas"):
+            for metadata in results["metadatas"]:
+                if metadata and "source_path" in metadata:
+                    collection_files.add(metadata["source_path"])
+
+        new_files = current_s3_files - collection_files
+        deleted_files = collection_files - current_s3_files
+
+        if new_files:
+            logger.info(f"Found {len(new_files)} new files to add to collection")
+            for file_key in new_files:
+                try:
+                    logger.info(f"Processing new file: {file_key}")
+                    response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+                    file_obj = io.BytesIO(response["Body"].read())
+
+                    pages = s3_processor.extract_text_from_pdf(file_obj, os.path.basename(file_key))
+                    if not pages:
+                        logger.warning(f"No meaningful pages extracted from {file_key}")
+                        continue
+
+                    documents = [
+                        Document(
+                            page_content=page["text"],
+                            metadata={
+                                "source_path": file_key,
+                                "page_index": page["page_index"]
+                            }
+                        ) for page in pages
+                    ]
+
+                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100)
+                    split_docs = []
+                    for doc in documents:
+                        chunks = text_splitter.split_text(doc.page_content)
+                        for chunk in chunks:
+                            split_docs.append(Document(page_content=chunk, metadata=doc.metadata))
+
+                    if split_docs:
+                        vectorstore.add_documents(split_docs)
+                        logger.info(f"Added {len(split_docs)} chunks from {file_key}")
+                except Exception as e:
+                    logger.error(f"Failed processing new file {file_key}: {e}")
+
+        if deleted_files:
+            logger.info(f"Found {len(deleted_files)} files to remove from collection")
+            for file_key in deleted_files:
+                try:
+                    vectorstore.delete(where={"source_path": file_key})
+                    logger.info(f"Removed documents for deleted file: {file_key}")
+                except Exception as e:
+                    logger.error(f"Failed removing documents for {file_key}: {e}")
+
+        if new_files or deleted_files:
+            logger.info(f"Collection updated: {len(new_files)} files added, {len(deleted_files)} files removed")
+        else:
+            logger.info("No changes detected in S3 bucket")
+
+    # Case 2: Create new collection
     else:
         logger.info(f"Collection not found, creating new: {collection_name}")
         documents = s3_processor.fetch_and_process_pdf(folder_path, bucket_name)
@@ -56,17 +147,16 @@ def split_documents(bucket_name: str, folder_path: str):
             return None
 
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100)
-        
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            split_docs = list(executor.map(lambda doc: [Document(page_content=chunk, metadata=doc.metadata) for chunk in text_splitter.split_text(doc.page_content)], documents))
-        
-        split_docs = [doc for sublist in split_docs for doc in sublist]  # Flatten the list
 
-        # split_docs = [
-        #     Document(page_content=chunk, metadata=doc.metadata)
-        #     for doc in documents
-        #     for chunk in text_splitter.split_text(doc.page_content)
-        # ]
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            split_docs_nested = executor.map(
+                lambda doc: [
+                    Document(page_content=chunk, metadata=doc.metadata)
+                    for chunk in text_splitter.split_text(doc.page_content)
+                ],
+                documents
+            )
+        split_docs = [doc for sublist in split_docs_nested for doc in sublist]
 
         if not split_docs:
             logger.warning("No meaningful content to embed.")
@@ -76,7 +166,7 @@ def split_documents(bucket_name: str, folder_path: str):
             documents=split_docs,
             embedding=OpenAIEmbeddings(model="text-embedding-3-small"),
             persist_directory=persist_dir,
-            collection_name=collection_name
+            collection_name=collection_name,
         )
 
     return vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
@@ -167,20 +257,16 @@ def extract_tags_from_question(question: str) -> List[str]:
 def get_answer(rag_chain, query_param: str) -> dict:
     logger.info(f"Getting answer for query: {query_param}")
     
-    if query_param in answer_cache:
-        logger.info("Using cached answer.")
-        return answer_cache[query_param]
+    # if query_param in answer_cache:
+    #     logger.info("Using cached answer.")
+    #     return answer_cache[query_param]
     
     results = rag_chain.invoke({"input": query_param})
     
-    # print(results)
-
     if "i don't know" in results['answer'].lower() or not results.get("context"):
-        cached = {"answer": "I don't know.", "context": []}
-        answer_cache[query_param] = cached
-        return cached
-    
-    answer_cache[query_param] = results
+        return {"answer": "I don't know.", "context": []}
+    # else:
+    #     answer_cache[query_param] = results
     return results
 
 @timeit
